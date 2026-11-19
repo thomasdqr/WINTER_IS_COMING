@@ -1,5 +1,5 @@
 // WinterIsComing — snow on your Mac desktop.
-// Snow piles up on top of windows, the Dock and the bottom of the screen and flies off when you drag a
+// Snow piles up on top of windows and the Dock and flies off when you drag a
 // window. Hover over the snow to roll snowballs, push them into each other, drag them with the mouse and
 // stack three of them into a snowman. See README.md for the full list.
 // Build: swiftc -O WinterIsComing.swift -o WinterIsComing
@@ -7,6 +7,7 @@
 
 import Cocoa
 import SpriteKit
+import Metal
 
 // MARK: - Settings (feel free to tweak)
 
@@ -14,7 +15,7 @@ enum Cfg {
     static var targetFlakes = 260            // number of flakes falling at the same time
     static let colW: CGFloat = 3             // width of one column of the snow height map (px)
     static let windowPileMax: CGFloat = 16   // max snow height on top of a window
-    static let groundPileMax: CGFloat = 34   // max snow height at the bottom of the screen
+    static let windowCorner: CGFloat = 16    // radius of macOS window corners; snow follows the curve down there
     static let gravity: CGFloat = 900        // gravity for snow sliding off
     static let pollInterval = 1.0 / 30.0     // how often window positions are checked (s)
     static let maxClumps = 900               // max number of falling snow clumps at once
@@ -220,7 +221,7 @@ let layers: [Layer] = [
     var swayFreq: CGFloat = 1
     var phase: CGFloat = 0
     var windFactor: CGFloat = 1
-    var inFront = false          // true = falls in front of windows (ignores them), lands on Dock / ground
+    var inFront = false          // true = falls in front of windows (ignores them), lands on the Dock
     var isClump = false          // true = clump sliding off a surface (affected by gravity)
     var ignoreID = -1            // don't land right back on the surface it came from
     var ignoreUntil: CGFloat = 0
@@ -238,11 +239,12 @@ let layers: [Layer] = [
     var h: [CGFloat]
     var caps: [CGFloat]          // max height per column, tapering at both ends so it looks rounded
     var occ: [Bool]              // whether this column is hidden behind a window in front
+    var base: [CGFloat]          // how far below topY the surface is (follows the rounded corners)
     let body = SKShapeNode()
     let shade = SKShapeNode()
     var dirty = false
 
-    init(minX: CGFloat, topY: CGFloat, width: CGFloat, maxH: CGFloat, parent: SKNode) {
+    init(minX: CGFloat, topY: CGFloat, width: CGFloat, maxH: CGFloat, corner: CGFloat = 0, parent: SKNode) {
         self.minX = minX
         self.topY = topY
         self.width = width
@@ -255,6 +257,15 @@ let layers: [Layer] = [
             let t = min(1, edgeDist / (maxH * 2.2))
             return maxH * t.squareRoot()
         }
+        // Circle of radius `corner` at each end: the surface drops by R - sqrt(R² - (R - d)²) at distance d from the edge
+        let R = min(corner, width / 2)
+        base = (0..<n).map { i in
+            let d = min(CGFloat(i) + 0.5, CGFloat(n - i) - 0.5) * Cfg.colW
+            guard d < R else { return 0 }
+            return -(R - (R * R - (R - d) * (R - d)).squareRoot())
+        }
+        // Snow can't sit on the steep part of the curve, so it thins out there
+        for i in 0..<n where base[i] < 0 { caps[i] *= max(0, 1 + base[i] / max(1, R * 0.5)) }
         body.fillColor = NSColor(calibratedWhite: 1, alpha: 0.97)
         body.strokeColor = .clear
         body.lineWidth = 0
@@ -277,7 +288,8 @@ let layers: [Layer] = [
         return (c >= 0 && c < count) ? c : nil
     }
     func colX(_ c: Int) -> CGFloat { minX + (CGFloat(c) + 0.5) * Cfg.colW }
-    func surface(_ c: Int) -> CGFloat { topY + h[c] }
+    func surface(_ c: Int) -> CGFloat { topY + base[c] + h[c] }
+    func baseY(at x: CGFloat) -> CGFloat { topY + (col(at: x).map { base[$0] } ?? 0) }
 
     func add(at c: Int, amount: CGFloat) {
         let spread: [(Int, CGFloat)] = [(0, 1), (-1, 0.75), (1, 0.75), (-2, 0.45), (2, 0.45), (-3, 0.2), (3, 0.2)]
@@ -319,9 +331,10 @@ let layers: [Layer] = [
             return
         }
         let p = CGMutablePath()
-        p.move(to: CGPoint(x: minX, y: topY))
-        for c in 0..<count { p.addLine(to: CGPoint(x: colX(c), y: topY + h[c])) }
-        p.addLine(to: CGPoint(x: minX + width, y: topY))
+        p.move(to: CGPoint(x: minX, y: topY + base[0]))
+        for c in 0..<count { p.addLine(to: CGPoint(x: colX(c), y: topY + base[c] + h[c])) }
+        p.addLine(to: CGPoint(x: minX + width, y: topY + base[count - 1]))
+        for c in stride(from: count - 1, through: 0, by: -1) { p.addLine(to: CGPoint(x: colX(c), y: topY + base[c])) }
         p.closeSubpath()
         body.path = p
         shade.path = p
@@ -341,18 +354,24 @@ final class SnowScene: SKScene {
     var piles: [Int: Pile] = [:]                 // window number -> snow on top of it
     var lastRect: [Int: CGRect] = [:]
     var order: [(id: Int, rect: CGRect)] = []    // windows from front to back
-    var ground: Pile?
     var tex: SKTexture?
     var lastT: TimeInterval = 0
     var pollAcc: CGFloat = 0
     var t: CGFloat = 0
     let myPID = getpid()
     let world = SKNode()
-    let dockTracker = DockTracker()
+    static let dockTracker = DockTracker()     // shared, so the Accessibility prompt shows only once
+    let screen: NSScreen
+    weak var overlay: NSWindow?
     var dockPile: Pile?
     var dockRect: CGRect?
     var dockAcc: CGFloat = 1
-    var lastDockStatus = ""
+    static var lastDockStatus = ""
+    // Reading windows and the Dock is slow, so all screens share one copy per frame instead of each asking
+    static var windowInfo: [[String: Any]] = []
+    static var windowInfoTime: TimeInterval = -1
+    static var dockFrame: CGRect?
+    static var dockFrameTime: TimeInterval = -1
     var balls: [Snowball] = []
     weak var activeBall: Snowball?
     var lastMouse = NSEvent.mouseLocation
@@ -364,33 +383,64 @@ final class SnowScene: SKScene {
     var speckTex: SKTexture?
     static let dockID = -2
 
-    override func didMove(to view: SKView) {
+    init(screen: NSScreen) {
+        self.screen = screen
+        super.init(size: screen.frame.size)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    /// macOS global coordinates (origin top-left of the main screen) -> this scene (origin bottom-left of its screen)
+    func local(_ r: CGRect) -> CGRect {
+        let mainH = NSScreen.screens.first?.frame.height ?? size.height
+        return CGRect(x: r.minX - screen.frame.minX, y: mainH - r.maxY - screen.frame.minY,
+                      width: r.width, height: r.height)
+    }
+
+    /// Mouse position in this scene's coordinates
+    func mouse() -> CGPoint {
+        let m = NSEvent.mouseLocation
+        return CGPoint(x: m.x - screen.frame.minX, y: m.y - screen.frame.minY)
+    }
+
+    /// The scene of another screen that contains this local point, if any
+    func otherScene(at p: CGPoint) -> SnowScene? {
+        let g = CGPoint(x: p.x + screen.frame.minX, y: p.y + screen.frame.minY)
+        return (NSApp.delegate as? AppDelegate)?.scenes.first { $0 !== self && $0.screen.frame.contains(g) }
+    }
+
+    /// Move a ball to another screen's scene, keeping its place on the desktop
+    func handOver(_ b: Snowball, to other: SnowScene) {
+        b.x += screen.frame.minX - other.screen.frame.minX
+        b.y += screen.frame.minY - other.screen.frame.minY
+        b.node.removeFromParent()
+        other.world.addChild(b.node)
+        balls.removeAll { $0 === b }
+        other.balls.append(b)
+        if activeBall === b { activeBall = nil }
+        if dragBall === b {
+            other.dragBall = b
+            other.dragOffset = dragOffset
+            other.dragVel = dragVel
+            dragBall = nil
+        }
+        b.layout()
+    }
+
+    func setUp() {
+        lastMouse = mouse()
         backgroundColor = .clear
         tex = makeFlakeTexture()
         ballTex = makeSnowballTexture()
         speckTex = makeSpeckTexture()
         addChild(world)
-        resetGround()
         for _ in 0..<Cfg.targetFlakes { spawnFlake(y: rnd(0, size.height)) }
-    }
-
-    override func didChangeSize(_ oldSize: CGSize) {
-        guard tex != nil else { return }
-        resetGround()
-    }
-
-    func resetGround() {
-        for b in balls where b.pile === ground { b.drop(vel: .zero) }
-        ground?.remove()
-        ground = Pile(minX: 0, topY: 0, width: size.width, maxH: Cfg.groundPileMax, parent: world)
     }
 
     func clearAll() {
         for p in piles.values { p.clear(); p.redraw() }
         dockPile?.clear()
         dockPile?.redraw()
-        ground?.clear()
-        ground?.redraw()
         for b in balls { b.node.removeFromParent() }
         balls.removeAll()
     }
@@ -462,7 +512,7 @@ final class SnowScene: SKScene {
             var amount = p.h[c] / 3.5 * k
             while amount > 0 {
                 if amount < 1 && CGFloat.random(in: 0...1) > amount { break }
-                spawnClump(at: CGPoint(x: p.colX(c) + rnd(-1.5, 1.5), y: p.topY + rnd(0, p.h[c])),
+                spawnClump(at: CGPoint(x: p.colX(c) + rnd(-1.5, 1.5), y: p.topY + p.base[c] + rnd(0, p.h[c])),
                            vel: CGVector(dx: fling.dx + rnd(-40, 40), dy: fling.dy + rnd(10, 80)),
                            sourceID: id)
                 amount -= 1
@@ -494,8 +544,8 @@ final class SnowScene: SKScene {
     /// The overlay normally lets every click through. Only while the mouse is over a snowball (or dragging one)
     /// does it catch clicks, so you can grab the ball without clicking the window underneath.
     func updateMouseCapture() {
-        guard let w = view?.window else { return }
-        let capture = dragBall != nil || ballAt(NSEvent.mouseLocation) != nil
+        guard let w = overlay else { return }
+        let capture = dragBall != nil || ballAt(mouse()) != nil
         if w.ignoresMouseEvents == capture { w.ignoresMouseEvents = !capture }
     }
 
@@ -525,7 +575,7 @@ final class SnowScene: SKScene {
     }
 
     override func mouseDown(with event: NSEvent) {
-        let m = event.location(in: self)
+        let m = mouse()
         guard let b = ballAt(m) else { return }
         // Anything stacked on top of the grabbed ball tumbles off
         var a = above(b)
@@ -545,11 +595,9 @@ final class SnowScene: SKScene {
         dragVel = .zero
     }
 
-    override func mouseDragged(with event: NSEvent) {
-        dragTarget = event.location(in: self)
-    }
+    override func mouseUp(with event: NSEvent) { endDrag() }
 
-    override func mouseUp(with event: NSEvent) {
+    func endDrag() {
         guard let b = dragBall else { return }
         dragBall = nil
         b.dragging = false
@@ -568,6 +616,8 @@ final class SnowScene: SKScene {
     }
 
     func stepDrag(_ b: Snowball, _ dt: CGFloat) {
+        if NSEvent.pressedMouseButtons & 1 == 0 { endDrag(); return }
+        dragTarget = mouse()
         let target = CGPoint(x: dragTarget.x + dragOffset.x, y: dragTarget.y + dragOffset.y)
         if dt > 0 {
             let v = CGVector(dx: (target.x - b.x) / dt, dy: (target.y - b.y) / dt)
@@ -576,7 +626,8 @@ final class SnowScene: SKScene {
         b.specks.zRotation -= (target.x - b.x) / b.r
         b.x = target.x
         b.y = target.y
-        lastMouse = NSEvent.mouseLocation
+        lastMouse = mouse()
+        if !CGRect(origin: .zero, size: size).contains(dragTarget), let other = otherScene(at: dragTarget) { handOver(b, to: other) }
     }
 
     /// A ball dropped just above another ball (that isn't already a full snowman) gets stacked on it
@@ -681,7 +732,7 @@ final class SnowScene: SKScene {
         return m.y >= p.topY - 6 && m.y <= p.topY + p.h[c] + 14
     }
 
-    /// Which snow surface is the mouse hovering over? Dock first, then windows front to back, then the ground.
+    /// Which snow surface is the mouse hovering over? Dock first, then windows front to back.
     func surfaceUnderMouse(_ m: CGPoint) -> Pile? {
         // Hovering over a snowball counts as hovering over the snow it sits on. Without this, a big ball
         // stops rolling as soon as the cursor rises above the thin snow band, which makes pushing jerky.
@@ -695,12 +746,11 @@ final class SnowScene: SKScene {
             if let p = piles[item.id], mouseOver(p, m) { return p }
             if item.rect.contains(m) { return nil }      // over a window's content
         }
-        if let g = ground, mouseOver(g, m) { return g }
         return nil
     }
 
     func updateRolling() {
-        let m = NSEvent.mouseLocation     // same coordinates as the scene (origin bottom-left of main screen)
+        let m = mouse()
         let dx = m.x - lastMouse.x
         lastMouse = m
         guard let p = surfaceUnderMouse(m) else { activeBall = nil; return }
@@ -716,7 +766,7 @@ final class SnowScene: SKScene {
             let b = Snowball(body: ballTex!, specks: speckTex!)
             b.x = m.x
             b.pile = p
-            b.y = p.topY + b.r - 1.5
+            b.y = p.baseY(at: b.x) + b.r - 1.5
             b.layout()
             world.addChild(b.node)
             balls.append(b)
@@ -730,6 +780,14 @@ final class SnowScene: SKScene {
 
         // Move the ball to the mouse, staying on the surface
         let lo = p.minX + b.r, hi = p.minX + p.width - b.r
+        // Mouse went past the end of the surface: the ball rolls off and falls instead of sticking to the edge
+        if m.x < lo - b.r * 0.5 || m.x > hi + b.r * 0.5 {
+            let dir: CGFloat = m.x > hi ? 1 : -1
+            b.x = dir > 0 ? p.minX + p.width + 0.5 : p.minX - 0.5   // just past the edge, so it doesn't land back on it
+            b.drop(vel: CGVector(dx: dir * 140, dy: 40))
+            activeBall = nil
+            return
+        }
         let newX = lo < hi ? min(max(m.x, lo), hi) : b.x
         let moved = newX - b.x
         guard abs(moved) > 0.01 else { return }
@@ -810,6 +868,10 @@ final class SnowScene: SKScene {
                 if b.vel.dy < 0, let p = landingSurface(x: b.x, from: prevBottom, to: b.y - b.r) {
                     splat(b, on: p)                  // falling snowballs burst into a heap of snow
                     gone = true
+                } else if !CGRect(origin: .zero, size: size).contains(CGPoint(x: b.x, y: b.y)), let other = otherScene(at: CGPoint(x: b.x, y: b.y)) {
+                    handOver(b, to: other)            // thrown or rolled onto another screen
+                    i -= 1
+                    continue
                 } else if b.y < -b.r * 2 || b.x < -100 || b.x > size.width + 100 {
                     gone = true
                 }
@@ -829,7 +891,7 @@ final class SnowScene: SKScene {
                 } else {
                     b.node.isHidden = true
                 }
-                b.y = p.topY + b.r - 1.5           // sits slightly sunk into the snow
+                b.y = p.baseY(at: b.x) + b.r - 1.5           // sits slightly sunk into the snow
             } else {
                 b.drop(vel: .zero)                 // lost its support (e.g. the ball below was removed)
             }
@@ -843,8 +905,8 @@ final class SnowScene: SKScene {
         }
     }
 
-    /// First surface a falling ball hits between two heights: the Dock, then window tops (front to back),
-    /// then the bottom of the screen. Returns nil if it hits nothing this frame.
+    /// First surface a falling ball hits between two heights: the Dock, then window tops (front to back).
+    /// Returns nil if it hits nothing this frame.
     func landingSurface(x: CGFloat, from top: CGFloat, to bottom: CGFloat) -> Pile? {
         func crosses(_ p: Pile) -> Bool {
             guard let c = p.col(at: x), !p.occ[c] else { return false }
@@ -855,8 +917,6 @@ final class SnowScene: SKScene {
         for item in order {
             if let p = piles[item.id], crosses(p) { return p }
         }
-        // The ground catches everything that reaches the bottom, even where a window covers it
-        if let g = ground, let c = g.col(at: x), bottom < g.surface(c) { return g }
         return nil
     }
 
@@ -889,7 +949,7 @@ final class SnowScene: SKScene {
         b.pile = p
         let lo = p.minX + b.r, hi = p.minX + p.width - b.r
         if lo < hi { b.x = min(max(b.x, lo), hi) }
-        b.y = p.topY + b.r - 1.5
+        b.y = p.baseY(at: b.x) + b.r - 1.5
     }
 
     /// A falling snowball bursts into loose snow when it hits the ground
@@ -904,10 +964,14 @@ final class SnowScene: SKScene {
 
     // Read all window frames (macOS origin is top-left, SpriteKit is bottom-left, so flip y)
     func pollWindows(dt: CGFloat) {
-        let H = size.height
         var newOrder: [(id: Int, rect: CGRect)] = []
-        if let info = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] {
-            for w in info {
+        let now = CACurrentMediaTime()
+        if now - SnowScene.windowInfoTime > Cfg.pollInterval / 2 {
+            SnowScene.windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            SnowScene.windowInfoTime = now
+        }
+        do {
+            for w in SnowScene.windowInfo {
                 guard let layerN = w[kCGWindowLayer as String] as? NSNumber, layerN.intValue == 0,
                       let pidN = w[kCGWindowOwnerPID as String] as? NSNumber, pidN.int32Value != myPID,
                       let numN = w[kCGWindowNumber as String] as? NSNumber,
@@ -916,7 +980,7 @@ final class SnowScene: SKScene {
                 let alpha = (w[kCGWindowAlpha as String] as? NSNumber)?.doubleValue ?? 1
                 if alpha < 0.05 || b.width < 80 || b.height < 40 { continue }
                 newOrder.append((id: numN.intValue,
-                                 rect: CGRect(x: b.minX, y: H - b.maxY, width: b.width, height: b.height)))
+                                 rect: local(b)))
             }
         }
 
@@ -936,7 +1000,7 @@ final class SnowScene: SKScene {
                     // Width changed: drop the snow and start a new pile
                     release(pile, vel: .zero, id: id)
                     pile.remove()
-                    piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width, maxH: Cfg.windowPileMax, parent: world)
+                    piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width, maxH: Cfg.windowPileMax, corner: Cfg.windowCorner, parent: world)
                 } else if abs(old.minX - r.minX) > 0.3 || abs(old.maxY - r.maxY) > 0.3 {
                     // Window dragged: fling the snow off
                     let v = CGVector(dx: (r.minX - old.minX) / dt, dy: (r.maxY - old.maxY) / dt)
@@ -945,7 +1009,7 @@ final class SnowScene: SKScene {
                     release(pile, vel: v, id: id)
                 }
             } else {
-                piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width, maxH: Cfg.windowPileMax, parent: world)
+                piles[id] = Pile(minX: r.minX, topY: r.maxY, width: r.width, maxH: Cfg.windowPileMax, corner: Cfg.windowCorner, parent: world)
             }
             lastRect[id] = r
         }
@@ -961,37 +1025,43 @@ final class SnowScene: SKScene {
         computeOcclusion()
         for p in piles.values { p.redraw() }
         dockPile?.redraw()
-        ground?.redraw()
     }
 
     func updateDock() {
         var r: CGRect? = nil
         var status: String
-        if let f = dockTracker.frame() {
-            var s = CGRect(x: f.minX - Cfg.dockPad, y: size.height - f.maxY,
-                           width: f.width + 2 * Cfg.dockPad, height: f.height)
+        let now = CACurrentMediaTime()
+        if now - SnowScene.dockFrameTime > 0.25 {
+            SnowScene.dockFrame = SnowScene.dockTracker.frame()
+            SnowScene.dockFrameTime = now
+        }
+        if let f = SnowScene.dockFrame {
+            let l = local(f)
+            var s = CGRect(x: l.minX - Cfg.dockPad, y: l.minY, width: l.width + 2 * Cfg.dockPad, height: l.height)
             // The AX frame can reach a bit above the visible Dock shelf. When the Dock is always
             // shown, the space macOS reserves for it (bottom of visibleFrame) is a better top edge.
-            if let screen = NSScreen.screens.first {
+            do {
                 let reserved = screen.visibleFrame.minY - screen.frame.minY
                 if reserved > 10 && reserved < s.maxY { s.size.height = reserved - s.minY }
             }
             // Only handle a Dock that sits at the bottom of the screen and is currently on screen.
             // With auto-hide, a hidden Dock is reported below the screen edge, so it fails this check.
-            if s.width > s.height && s.minY < 40 && s.maxY > 8 {
+            if s.midX < 0 || s.midX > size.width {
+                status = ""     // the Dock is on another screen
+            } else if s.width > s.height && s.minY < 40 && s.maxY > 8 {
                 r = s
-                status = "found at x=\(Int(s.minX)) width=\(Int(s.width)) top=\(Int(s.maxY)) (AX top \(Int(size.height - f.minY)), screen \(Int(size.width))x\(Int(size.height)))"
+                status = "found at x=\(Int(s.minX)) width=\(Int(s.width)) top=\(Int(s.maxY)) (AX top \(Int(l.maxY)), screen \(Int(size.width))x\(Int(size.height)))"
             } else {
                 status = "ignored (not at bottom or hidden), AX frame = \(f)"
             }
         } else {
-            status = "not found: \(dockTracker.lastError)"
+            status = "not found: \(SnowScene.dockTracker.lastError)"
         }
         // Log only when the status changes, so the terminal doesn't get flooded
         let key = status.components(separatedBy: " at ").first ?? status
-        if key != lastDockStatus {
+        if !status.isEmpty && key != SnowScene.lastDockStatus {
             print("❄︎ Dock " + status)
-            lastDockStatus = key
+            SnowScene.lastDockStatus = key
         }
         if let old = dockRect, let r = r,
            abs(old.minX - r.minX) < 0.5, abs(old.width - r.width) < 0.5, abs(old.maxY - r.maxY) < 0.5 {
@@ -1024,18 +1094,6 @@ final class SnowScene: SKScene {
                     p.occ[c] = o
                     if o { p.h[c] = 0 }
                     p.dirty = true
-                }
-            }
-        }
-        if let g = ground {
-            for c in 0..<g.count {
-                let pt = CGPoint(x: g.colX(c), y: 1)
-                var o = false
-                for item in order where item.rect.contains(pt) { o = true; break }
-                if o != g.occ[c] {
-                    g.occ[c] = o
-                    if o { g.h[c] = 0 }
-                    g.dirty = true
                 }
             }
         }
@@ -1086,11 +1144,6 @@ final class SnowScene: SKScene {
                         break
                     }
                 } }
-                // Finally the bottom of the screen
-                if !gone, let g = ground, let c = g.col(at: p.x), p.y < g.surface(c) {
-                    if !g.occ[c] { g.add(at: c, amount: f.isClump ? 1.6 : f.size * 0.12) }
-                    gone = true
-                }
             }
             if !gone {
                 // Flakes that fall "behind" a window disappear
@@ -1118,9 +1171,56 @@ final class SnowScene: SKScene {
 
 // MARK: - Transparent full-screen window + menu bar icon
 
-/// Lets the very first click reach the scene even though this app is never the active app
-final class OverlaySKView: SKView {
+/// Draws one screen's scene, paced by that screen's own display link. With one SKView per screen, SpriteKit
+/// starved the 120 Hz built-in display (about 10 fps) as soon as a 60 Hz display also showed a view.
+final class SnowView: NSView {
+    let scene: SnowScene
+    let renderer: SKRenderer
+    let queue: MTLCommandQueue
+    let metal = CAMetalLayer()
+    var link: CADisplayLink?
+
+    init(scene: SnowScene, screen: NSScreen) {
+        let device = MTLCreateSystemDefaultDevice()!
+        self.scene = scene
+        renderer = SKRenderer(device: device)
+        queue = device.makeCommandQueue()!
+        super.init(frame: NSRect(origin: .zero, size: screen.frame.size))
+        renderer.scene = scene
+        renderer.ignoresSiblingOrder = true
+        metal.device = device
+        metal.pixelFormat = .bgra8Unorm
+        metal.isOpaque = false
+        metal.contentsScale = screen.backingScaleFactor
+        metal.drawableSize = CGSize(width: bounds.width * screen.backingScaleFactor,
+                                    height: bounds.height * screen.backingScaleFactor)
+        layer = metal
+        wantsLayer = true
+        link = screen.displayLink(target: self, selector: #selector(tick))
+        link?.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)   // 120 Hz costs twice the CPU for no visible gain
+        link?.add(to: .main, forMode: .common)
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    // Lets the very first click reach the scene even though this app is never the active app
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseDown(with event: NSEvent) { scene.mouseDown(with: event) }
+    override func mouseUp(with event: NSEvent) { scene.mouseUp(with: event) }
+
+    @objc func tick(_ link: CADisplayLink) {
+        guard !scene.isPaused, let drawable = metal.nextDrawable(), let commands = queue.makeCommandBuffer() else { return }
+        renderer.update(atTime: CACurrentMediaTime())
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = drawable.texture
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        pass.colorAttachments[0].storeAction = .store
+        renderer.render(withViewport: CGRect(origin: .zero, size: metal.drawableSize),
+                        commandBuffer: commands, renderPassDescriptor: pass)
+        commands.present(drawable)
+        commands.commit()
+    }
 }
 
 final class OverlayWindow: NSPanel {
@@ -1129,37 +1229,16 @@ final class OverlayWindow: NSPanel {
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: OverlayWindow!
-    var scene: SnowScene!
+    var windows: [OverlayWindow] = []
+    var scenes: [SnowScene] = []
+    var screenFrames: [NSRect] = []
+    var paused = false
     var statusItem: NSStatusItem!
     var pauseItem: NSMenuItem!
     var amountItems: [NSMenuItem] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        guard let screen = NSScreen.screens.first else { return }
-        // A non-activating panel can take a click (to grab a snowball) without stealing focus from your apps
-        window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
-                               backing: .buffered, defer: false)
-        window.hidesOnDeactivate = false
-        window.becomesKeyOnlyIfNeeded = true
-        window.isOpaque = false
-        window.backgroundColor = .clear
-        window.hasShadow = false
-        window.ignoresMouseEvents = true          // clicks pass straight through
-        window.level = .floating                  // above normal windows, below the Dock and menu bar
-        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
-
-        let view = OverlaySKView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        view.allowsTransparency = true
-        view.preferredFramesPerSecond = 60
-        view.ignoresSiblingOrder = true
-        scene = SnowScene(size: screen.frame.size)
-        scene.scaleMode = .resizeFill
-        view.presentScene(scene)
-        window.contentView = view
-        window.setFrame(screen.frame, display: true)
-        window.orderFrontRegardless()
-
+        buildWindows()
         setupMenu()
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
@@ -1175,14 +1254,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// One transparent snow window per screen
+    func buildWindows() {
+        for w in windows { (w.contentView as? SnowView)?.link?.invalidate(); w.orderOut(nil) }
+        windows.removeAll()
+        scenes.removeAll()
+        screenFrames = NSScreen.screens.map { $0.frame }
+        for screen in NSScreen.screens { addWindow(on: screen) }
+    }
+
+    func addWindow(on screen: NSScreen) {
+        // A non-activating panel can take a click (to grab a snowball) without stealing focus from your apps
+        let window = OverlayWindow(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                               backing: .buffered, defer: false)
+        window.hidesOnDeactivate = false
+        window.becomesKeyOnlyIfNeeded = true
+        window.isOpaque = false
+        window.backgroundColor = .clear
+        window.hasShadow = false
+        window.ignoresMouseEvents = true          // clicks pass straight through
+        window.level = .floating                  // above normal windows, below the Dock and menu bar
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
+
+        let scene = SnowScene(screen: screen)
+        scene.isPaused = paused
+        scene.scaleMode = .fill                   // the scene is in points, the drawable in pixels
+        scene.overlay = window
+        scene.setUp()
+        window.contentView = SnowView(scene: scene, screen: screen)
+        window.setFrame(screen.frame, display: true)
+        if !paused { window.orderFrontRegardless() }
+        windows.append(window)
+        scenes.append(scene)
+    }
+
     @objc func suspendRendering() {
-        (window.contentView as? SKView)?.isPaused = true
+        for w in windows { (w.contentView as? SnowView)?.link?.isPaused = true }
     }
 
     @objc func resumeRendering() {
         // Stay paused if the user paused snow from the menu
-        guard !scene.isPaused else { return }
-        (window.contentView as? SKView)?.isPaused = false
+        guard !paused else { return }
+        for w in windows { (w.contentView as? SnowView)?.link?.isPaused = false }
     }
 
     func setupMenu() {
@@ -1217,14 +1330,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func togglePause() {
-        scene.isPaused.toggle()
-        if scene.isPaused {
-            window.orderOut(nil)
-            pauseItem.title = "Resume Snow"
-        } else {
-            window.orderFrontRegardless()
-            pauseItem.title = "Pause Snow"
-        }
+        paused.toggle()
+        for s in scenes { s.isPaused = paused }
+        for w in windows { if paused { w.orderOut(nil) } else { w.orderFrontRegardless() } }
+        pauseItem.title = paused ? "Resume Snow" : "Pause Snow"
     }
 
     @objc func setAmount(_ sender: NSMenuItem) {
@@ -1232,11 +1341,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for it in amountItems { it.state = (it === sender) ? .on : .off }
     }
 
-    @objc func clearSnow() { scene.clearAll() }
+    @objc func clearSnow() { for s in scenes { s.clearAll() } }
 
     @objc func screensChanged() {
-        guard let screen = NSScreen.screens.first else { return }
-        window.setFrame(screen.frame, display: true)
+        // This also fires for small changes (like the Dock appearing); only rebuild when screens really changed
+        if NSScreen.screens.map({ $0.frame }) != screenFrames { buildWindows() }
     }
 }
 
