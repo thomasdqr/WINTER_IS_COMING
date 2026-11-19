@@ -8,15 +8,15 @@ Snow falls on your desktop and piles up on your windows and Dock. Roll it into s
 
 ## What it can do ✨
 
-- 🌨️ **Cozy snowfall**: three layers of flakes (near, middle and far) drifting in a gentle wind
-- 🏔️ **Snow piles up** on top of your windows, along the Dock and at the bottom of the screen
-- 🪟 **Drag a window and *whoosh*!** The snow flies off. The faster you drag, the farther it goes
-- ⚪ **Roll snowballs** just by moving your mouse sideways over the snow (no clicking!). They grow as they roll
-- 🎳 **Snowballs push each other** along, and one that's pushed off the edge falls down
-- 🖐️ **Hold a snowball** with the left mouse button and carry it anywhere
-- ⛄ **Stack three snowballs** and they turn into a snowman with a carrot nose and a red scarf
-- 💥 **A falling snowball goes *poof*** into a soft heap of snow, ready to be rolled again
-- ✨ **Fairy lights**: colorful twinkling lights that swing into place along the top of your windows. They're off by default, so turn them on from the ❄︎ menu (or press `L`)
+- **Cozy snowfall**: three layers of flakes (near, middle and far) drifting in a gentle wind
+- **Snow piles up** on top of your windows, along the Dock and at the bottom of the screen
+- **Drag a window and *whoosh*!** The snow flies off. The faster you drag, the farther it goes
+- **Roll snowballs** just by moving your mouse sideways over the snow (no clicking!). They grow as they roll
+- **Snowballs push each other** along, and one that's pushed off the edge falls down
+- **Hold a snowball** with the left mouse button and carry it anywhere
+- **Stack three snowballs** and they turn into a snowman with a carrot nose and a red scarf
+- **A falling snowball goes *poof*** into a soft heap of snow, ready to be rolled again
+- **Fairy lights**: colorful twinkling lights that swing into place along the top of your windows. They're off by default, so turn them on from the ❄︎ menu (or press `L`)
 
 ## How to play 🎮
 
