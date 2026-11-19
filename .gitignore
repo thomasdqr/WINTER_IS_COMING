@@ -1,6 +1,13 @@
 # Compiled binary (built by build.sh)
 /WinterIsComing
 
+# Packaged app (built by make_app.sh)
+dist/
+
+# Windows build output
+windows/bin/
+windows/obj/
+
 # Temporary / editor files
 *.new
 .DS_Store

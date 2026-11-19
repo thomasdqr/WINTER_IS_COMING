@@ -28,6 +28,12 @@ enum Cfg {
     static let ballStartRadius: CGFloat = 3  // a new snowball starts this small
     static let ballMaxRadius: CGFloat = 28   // and stops growing at this size
     static let maxBalls = 20                 // oldest resting snowballs are removed beyond this
+    static let lightSpacing: CGFloat = 22    // distance between fairy light bulbs
+    static let lightSpan: CGFloat = 120      // distance between the points where the wire is "hooked"
+    static let lightSag: CGFloat = 9         // how far the wire droops between hooks
+    static let lightInset: CGFloat = 14      // keep clear of the window's rounded corners
+    static let bulbGlow: CGFloat = 19        // size of a bulb's soft glow
+    static let bulbCore: CGFloat = 5.5       // size of a bulb's bright center
     static let dockGain: CGFloat = 3.0       // snow landing on the Dock counts this many times more, so it builds up
 }
 
@@ -346,6 +352,129 @@ let layers: [Layer] = [
     }
 }
 
+// MARK: - Fairy lights
+
+/// One glowing bulb: a soft colored glow with a brighter center that twinkles
+@MainActor final class Bulb {
+    let glow: SKSpriteNode
+    let core: SKSpriteNode
+    let phase = rnd(0, 6.28)
+    let speed = rnd(1.2, 3.0)
+    var pos = CGPoint.zero
+
+    init(texture: SKTexture, color: NSColor) {
+        glow = SKSpriteNode(texture: texture)
+        glow.color = color
+        glow.colorBlendFactor = 1
+        glow.size = CGSize(width: Cfg.bulbGlow, height: Cfg.bulbGlow)
+        core = SKSpriteNode(texture: texture)
+        core.color = color.blended(withFraction: 0.2, of: .white) ?? color   // keep the center colorful
+        core.colorBlendFactor = 1
+        core.size = CGSize(width: Cfg.bulbCore, height: Cfg.bulbCore)
+        core.zPosition = 0.1
+    }
+
+    /// reveal goes 0 → 1 as the bulb lights up after being hung
+    func twinkle(_ t: CGFloat, reveal: CGFloat) {
+        let k = 0.75 + 0.25 * sin(t * speed + phase)
+        glow.alpha = 0.8 * k * reveal
+        core.alpha = (0.85 + 0.15 * k) * reveal
+    }
+}
+
+/// A string of fairy lights hanging just below the top edge of one window
+@MainActor final class LightString {
+    static let colors: [NSColor] = [
+        NSColor(calibratedRed: 1.00, green: 0.10, blue: 0.12, alpha: 1),   // red
+        NSColor(calibratedRed: 1.00, green: 0.62, blue: 0.00, alpha: 1),   // amber
+        NSColor(calibratedRed: 0.05, green: 0.95, blue: 0.20, alpha: 1),   // green
+        NSColor(calibratedRed: 0.10, green: 0.42, blue: 1.00, alpha: 1),   // blue
+        NSColor(calibratedRed: 1.00, green: 0.15, blue: 0.62, alpha: 1),   // pink
+    ]
+    let node = SKNode()
+    let wire = SKShapeNode()
+    var bulbs: [Bulb] = []
+    var rect = CGRect.null
+    var hungAt: CGFloat = 0      // when this string was hung up
+    var swing: CGFloat = 0       // extra droop while it bounces
+    var sway: CGFloat = 0        // sideways swing of the bulbs
+    static let swingTime: CGFloat = 1.4
+
+    func animating(_ t: CGFloat) -> Bool { t - hungAt < LightString.swingTime }
+
+    /// Just after being hung, the string bounces and the bulbs swing, then settle down (a damped wobble)
+    func updateSwing(_ t: CGFloat) {
+        let tau = t - hungAt
+        guard tau < LightString.swingTime else { swing = 0; sway = 0; return }
+        let e = exp(-4.0 * tau)
+        swing = 0.9 * e * sin(13 * tau)
+        sway = 3.5 * e * sin(9.5 * tau)
+    }
+
+    /// Bulbs light up one after another from left to right as the string is hung
+    func reveal(_ i: Int, _ t: CGFloat) -> CGFloat {
+        max(0, min(1, (t - hungAt - CGFloat(i) * 0.015) / 0.08))
+    }
+
+    init(parent: SKNode) {
+        wire.strokeColor = NSColor(calibratedWhite: 0.12, alpha: 0.85)
+        wire.lineWidth = 1.2
+        node.zPosition = 5.5
+        node.addChild(wire)
+        parent.addChild(node)
+    }
+
+    /// Height of the wire at x: it droops between hooks like a real string of lights
+    func wireY(_ x: CGFloat) -> CGFloat {
+        let x0 = rect.minX + Cfg.lightInset
+        let w = max(1, rect.width - 2 * Cfg.lightInset)
+        let span = w / max(1, (w / Cfg.lightSpan).rounded())
+        let f = max(0, min(1, ((x - x0) / span).truncatingRemainder(dividingBy: 1)))
+        return rect.maxY - 3 - Cfg.lightSag * (1 + swing) * sin(.pi * f)
+    }
+
+    /// Follow the window; new bulbs are only made when its width changes
+    func place(in r: CGRect, texture: SKTexture) {
+        let w = max(0, r.width - 2 * Cfg.lightInset)
+        let count = max(2, Int(w / Cfg.lightSpacing))
+        rect = r
+        if bulbs.count != count {
+            for b in bulbs { b.glow.removeFromParent(); b.core.removeFromParent() }
+            bulbs = (0..<count).map { Bulb(texture: texture, color: LightString.colors[$0 % LightString.colors.count]) }
+            for b in bulbs { node.addChild(b.glow); node.addChild(b.core) }
+        }
+        for (i, b) in bulbs.enumerated() {
+            let x = r.minX + Cfg.lightInset + (CGFloat(i) + 0.5) * w / CGFloat(bulbs.count)
+            let dx = sway * (0.6 + 0.4 * sin(b.phase))      // each bulb swings a little differently
+            b.pos = CGPoint(x: x + dx, y: wireY(x) - 4)     // bulbs hang just under the wire
+            b.glow.position = b.pos
+            b.core.position = b.pos
+        }
+    }
+
+    /// Redraw the wire and hide the parts that are behind a window in front
+    func applyVisibility(hidden: (CGPoint) -> Bool) {
+        let p = CGMutablePath()
+        var pen = false
+        var x = rect.minX + Cfg.lightInset * 0.5
+        while x <= rect.maxX - Cfg.lightInset * 0.5 {
+            let pt = CGPoint(x: x, y: wireY(x))
+            if hidden(pt) { pen = false }
+            else if pen { p.addLine(to: pt) }
+            else { p.move(to: pt); pen = true }
+            x += 4
+        }
+        wire.path = p
+        for b in bulbs {
+            let h = hidden(b.pos)
+            b.glow.isHidden = h
+            b.core.isHidden = h
+        }
+    }
+
+    func remove() { node.removeFromParent() }
+}
+
 // MARK: - Scene
 
 final class SnowScene: SKScene {
@@ -372,6 +501,8 @@ final class SnowScene: SKScene {
     static var windowInfoTime: TimeInterval = -1
     static var dockFrame: CGRect?
     static var dockFrameTime: TimeInterval = -1
+    var lights: [Int: LightString] = [:]
+    var lightsOn = UserDefaults.standard.bool(forKey: "fairyLights")   // off by default, remembered between launches
     var balls: [Snowball] = []
     weak var activeBall: Snowball?
     var lastMouse = NSEvent.mouseLocation
@@ -537,6 +668,52 @@ final class SnowScene: SKScene {
         updateMouseCapture()
         if let b = dragBall { stepDrag(b, dt) } else { updateRolling() }
         stepBalls(dt)
+        if lightsOn {
+            if lights.values.contains(where: { $0.animating(t) }) { updateLights() }   // smooth swing, every frame
+            for s in lights.values {
+                for (i, b) in s.bulbs.enumerated() { b.twinkle(t, reveal: s.reveal(i, t)) }
+            }
+        }
+    }
+
+    // MARK: Fairy lights
+
+    func setLights(_ on: Bool) {
+        lightsOn = on
+        UserDefaults.standard.set(on, forKey: "fairyLights")
+        updateLights()
+    }
+
+    /// Hang a string of lights on every window, following it when it moves
+    func updateLights() {
+        guard lightsOn, let tex = tex else {
+            for s in lights.values { s.remove() }
+            lights.removeAll()
+            return
+        }
+        var alive = Set<Int>()
+        for (i, item) in order.enumerated() {
+            alive.insert(item.id)
+            let s: LightString
+            if let existing = lights[item.id] { s = existing } else {
+                s = LightString(parent: world)
+                s.hungAt = t
+                lights[item.id] = s
+            }
+            if s.rect != item.rect || s.animating(t) {
+                s.updateSwing(t)
+                s.place(in: item.rect, texture: tex)
+            }
+            s.applyVisibility { pt in
+                if pt.y > self.size.height { return true }
+                for j in 0..<i where self.order[j].rect.contains(pt) { return true }
+                return false
+            }
+        }
+        for (id, s) in lights where !alive.contains(id) {
+            s.remove()
+            lights[id] = nil
+        }
     }
 
     // MARK: Dragging & snowmen
@@ -1023,6 +1200,7 @@ final class SnowScene: SKScene {
         }
 
         computeOcclusion()
+        updateLights()
         for p in piles.values { p.redraw() }
         dockPile?.redraw()
     }
@@ -1057,10 +1235,10 @@ final class SnowScene: SKScene {
         } else {
             status = "not found: \(SnowScene.dockTracker.lastError)"
         }
-        // Log only when the status changes, so the terminal doesn't get flooded
+        // Log only problems, and only when the status changes, so the terminal stays quiet
         let key = status.components(separatedBy: " at ").first ?? status
         if !status.isEmpty && key != SnowScene.lastDockStatus {
-            print("❄︎ Dock " + status)
+            if r == nil { print("❄︎ Dock " + status) }
             SnowScene.lastDockStatus = key
         }
         if let old = dockRect, let r = r,
@@ -1235,11 +1413,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var paused = false
     var statusItem: NSStatusItem!
     var pauseItem: NSMenuItem!
+    var lightsItem: NSMenuItem!
     var amountItems: [NSMenuItem] = []
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindows()
         setupMenu()
+        // Show the how-to-play tips once, the very first time the app opens
+        if !UserDefaults.standard.bool(forKey: "seenGuide") {
+            UserDefaults.standard.set(true, forKey: "seenGuide")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.showGuide() }
+        }
         NotificationCenter.default.addObserver(self, selector: #selector(screensChanged),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
@@ -1320,9 +1504,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         amount.submenu = sub
         menu.addItem(amount)
 
+        lightsItem = NSMenuItem(title: "Fairy Lights ✨", action: #selector(toggleLights), keyEquivalent: "l")
+        lightsItem.target = self
+        lightsItem.state = scenes.first?.lightsOn == true ? .on : .off
+        menu.addItem(lightsItem)
+
         let clear = NSMenuItem(title: "Clear Snow", action: #selector(clearSnow), keyEquivalent: "c")
         clear.target = self
         menu.addItem(clear)
+
+        let guide = NSMenuItem(title: "How to Play ❔", action: #selector(showGuide), keyEquivalent: "")
+        guide.target = self
+        menu.addItem(guide)
 
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -1342,6 +1535,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func clearSnow() { for s in scenes { s.clearAll() } }
+
+    /// A small how-to-play note: the app has no window or Dock icon, so this is where people learn the tricks
+    @objc func showGuide() {
+        let alert = NSAlert()
+        alert.messageText = "Welcome to WinterIsComing ❄️"
+        alert.informativeText = """
+        It's snowing on your desktop! Here's what you can do:
+
+        ⚪  Roll a snowball: slide your mouse sideways over snow
+        🎳  Push it: roll one snowball into another
+        🖐️  Carry it: hold the left mouse button on a snowball and drag
+        ⛄  Build a snowman: stack three snowballs
+        🪟  Make snow fly: drag a window
+        ✨  Hang fairy lights: ❄︎ menu → Fairy Lights
+
+        Find everything under the ❄︎ in your menu bar. To get snow on the Dock too, allow this app in System Settings → Privacy & Security → Accessibility.
+        """
+        alert.addButton(withTitle: "Let it snow!")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    @objc func toggleLights() {
+        let on = scenes.first?.lightsOn != true
+        for s in scenes { s.setLights(on) }
+        lightsItem.state = on ? .on : .off
+    }
 
     @objc func screensChanged() {
         // This also fires for small changes (like the Dock appearing); only rebuild when screens really changed
